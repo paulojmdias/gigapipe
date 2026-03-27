@@ -105,8 +105,13 @@ server:
   write_timeout: 30s
 
 schema:
-  mode: flat              # flat | json_column
+  mode: flat              # flat | json_column | otel
   auto_discover: false    # if true, ignores columns below and runs DESCRIBE TABLE
+
+  # Only used when auto_discover: true
+  # How often (in seconds) to re-run DESCRIBE TABLE and refresh the column mapping.
+  # 0 means discover once at startup and never refresh.
+  auto_discover_refresh_seconds: 300   # default: 5 minutes
 
   table: app_logs
 
@@ -124,6 +129,12 @@ schema:
     # json_column mode: single column holding key-value pairs
     # json_column: attrs
 
+    # otel mode: map columns searched for dynamic label keys (in priority order)
+    # map_columns:
+    #   - LogAttributes
+    #   - ResourceAttributes
+    #   - ScopeAttributes
+
 query:
   default_limit: 1000
   max_limit: 5000
@@ -137,6 +148,7 @@ separator, e.g.:
 - `LOKI_CH_CLICKHOUSE__HOST=db.internal`
 - `LOKI_CH_SCHEMA__TABLE=my_table`
 - `LOKI_CH_SCHEMA__AUTO_DISCOVER=true`
+- `LOKI_CH_SCHEMA__AUTO_DISCOVER_REFRESH_SECONDS=60`
 
 ---
 
@@ -156,6 +168,27 @@ and applies the following heuristics to map columns:
 | **message** | Type is `String`, not low-cardinality, name contains `message`, `msg`, `body`, `log`, `text`, or is the only large String column |
 | **label** | Type is `LowCardinality(String)`, or `String`/`Enum` with name not matching message heuristic, cardinality < threshold |
 | **value** | Type is `Float64`, `Float32`, `Int*`, name contains `value`, `val`, `metric`, `count` |
+| **map** | Type is `Map(*)` — treated as dynamic label bag (OTel attributes columns) |
+
+### Schema Refresh
+
+When `auto_discover_refresh_seconds > 0`, a background goroutine re-runs discovery on
+that interval. This allows the service to pick up schema changes (e.g. a new label
+column added to the table, or new keys appearing in a Map column) without a restart.
+
+```
+startup
+  └─ discoverSchema() → builds SchemaConfig, stores in atomic.Pointer[SchemaConfig]
+       └─ if refresh_seconds > 0:
+            └─ goroutine: ticker(refresh_seconds)
+                 └─ on tick: discoverSchema() → atomic.Store(newSchema)
+                      └─ log "schema refreshed: added columns [foo, bar]"
+```
+
+Queries always read the schema via `atomic.Load`, so a refresh mid-flight is safe —
+the old schema finishes the in-progress query while new queries pick up the updated one.
+
+The current live schema is always visible at `GET /config`.
 
 Discovery result is logged at startup and can be dumped via `GET /config` so users
 can verify or copy it into an explicit config.
